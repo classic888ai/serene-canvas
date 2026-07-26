@@ -489,10 +489,11 @@ function dailyLevelId() {
 }
 const CATS = {
   myphotos:   { label: 'My Photos',   icon: '\uD83D\uDCF7', bg: '#f2ede4' },
+  // Order here IS the shelf + circle order. Zodiac sets sit at the bottom
+  // (niche taste vs. the universal florals/animals/homes), just above the
+  // always-last My Photos.
   flowers:    { label: 'Flowers',     icon: '\uD83C\uDF38', bg: '#f6eef0' },
   mandalas:   { label: 'Mandalas',    icon: '\uD83E\uDEB7', bg: '#efe9f2' },
-  zodiac:     { label: 'Zodiac',      icon: '\uD83C\uDF19', bg: '#eaeaf2' },
-  cnyzodiac:  { label: 'Chinese Zodiac', icon: '\uD83D\uDC09', bg: '#f4ebe8' },
   animals:    { label: 'Animals',     icon: '\uD83D\uDC3E', bg: '#f0ede6' },
   birds:      { label: 'Birds',       icon: '\uD83D\uDC26', bg: '#edf1ea' },
   landscapes: { label: 'Landscapes',  icon: '\uD83C\uDFDE', bg: '#eef2ea' },
@@ -500,6 +501,8 @@ const CATS = {
   interiors:  { label: 'Interiors',   icon: '\uD83D\uDECB', bg: '#f3eee8' },
   stilllife:  { label: 'Still Life',  icon: '\uD83C\uDFFA', bg: '#f2eee9' },
   coastal:    { label: 'Coastal',     icon: '\uD83C\uDF0A', bg: '#eaf0f3' },
+  zodiac:     { label: 'Zodiac',      icon: '\uD83C\uDF19', bg: '#eaeaf2' },
+  cnyzodiac:  { label: 'Chinese Zodiac', icon: '\uD83D\uDC09', bg: '#f4ebe8' },
 };
 let galleryFilter = 'all';
 
