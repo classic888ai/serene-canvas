@@ -1,6 +1,6 @@
 /* Serene Canvas service worker — precache app shell, offline-first.
    CACHE_VERSION is rewritten by pipeline/build.py on production builds. */
-const CACHE_VERSION = 'sp-a9ba9a42a8';
+const CACHE_VERSION = 'sp-6e9f208cbf';
 const PRECACHE = [
   './',
   'index.html',
