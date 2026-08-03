@@ -589,9 +589,12 @@ const CATS = {
   // above the always-last My Photos.
   homes:      { label: 'Homes',       icon: '\uD83C\uDFE1', bg: '#f5f0e8' },
   interiors:  { label: 'Interiors',   icon: '\uD83D\uDECB', bg: '#f3eee8' },
+  farmhouse:  { label: 'Farmhouse',   icon: '\uD83D\uDC04', bg: '#f2efe7' },
   flowers:    { label: 'Flowers',     icon: '\uD83C\uDF38', bg: '#f6eef0' },
+  botanical:  { label: 'Botanical',   icon: '\uD83C\uDF3F', bg: '#edf2ec' },
   mandalas:   { label: 'Mandalas',    icon: '\uD83E\uDEB7', bg: '#efe9f2' },
   animals:    { label: 'Animals',     icon: '\uD83D\uDC3E', bg: '#f0ede6' },
+  pets:       { label: 'Pets',        icon: '\uD83D\uDC31', bg: '#f4efe9' },
   birds:      { label: 'Birds',       icon: '\uD83D\uDC26', bg: '#edf1ea' },
   landscapes: { label: 'Landscapes',  icon: '\uD83C\uDFDE', bg: '#eef2ea' },
   stilllife:  { label: 'Still Life',  icon: '\uD83C\uDFFA', bg: '#f2eee9' },
