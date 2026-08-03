@@ -310,6 +310,10 @@
   /* long event titles ("Year of the Goat") must wrap without shoving the
      count and countdown pill out of alignment */
   .shelf-head > span:first-child { min-width: 0; }
+  .shelf-title { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  /* Slightly wider here than in the sheets: shelf headings run at 19px, so
+     the icon box scales with them or the gap reads as uneven. */
+  .shelf-head .ri { flex: 0 0 26px; width: 26px; font-size: 21px; }
   .shelf-head .cnt { font-size: 13px; color: var(--ink-soft); font-weight: 700; font-family: -apple-system, sans-serif; }
   .shelf-row {
     display: flex; gap: 12px; overflow-x: auto; padding: 4px 20px 8px;
@@ -783,13 +787,94 @@
     background: var(--sheet); border-radius: 28px 28px 0 0; width: 100%; max-width: 520px;
     padding: 22px 22px calc(var(--safe-bottom) + 26px);
     backdrop-filter: blur(20px) saturate(1.5); -webkit-backdrop-filter: blur(20px) saturate(1.5);
+    /* A drawer must never fill the screen. Tapping the backdrop was the only
+       way to close these, so a sheet tall enough to cover it trapped the
+       player — Settings is 855px on a 412x915 Pixel 7, leaving 60px of
+       backdrop before system insets ate the rest. Cap the height and scroll
+       the contents instead, so there is always something to tap. */
+    max-height: 86vh; overflow-y: auto; position: relative;
+    overscroll-behavior: contain;
   }
+  /* Every sheet gets a real close control. Backdrop-tap is an invisible
+     affordance — poor for anyone, worse for a 50+ audience, and useless
+     when there is no backdrop left. 52px to match the app's touch target. */
+  .sheet-close {
+    position: absolute; top: 12px; right: 12px;
+    width: 52px; height: 52px; border-radius: 50%; border: none;
+    background: var(--chipbg); color: var(--ink);
+    font-size: 20px; line-height: 1; font-weight: 700; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; z-index: 2;
+  }
+  /* Keep long headings clear of the close button */
+  .sheet > h2 { padding-right: 56px; }
   .sheet h2 { font-family: var(--serif); font-size: 22px; font-weight: 700; margin-bottom: 14px; }
   .sheet .row {
     display: flex; align-items: center; justify-content: space-between;
     padding: 12px 0; border-bottom: 1px solid var(--row-line); font-weight: 600; font-size: 16px;
   }
   .sheet .row:last-child { border-bottom: none; }
+  .sheet .row > span { display: flex; align-items: center; gap: 10px; }
+  /* Emoji advance widths differ per glyph (🖌️ is far wider than 💡), so a
+     leading emoji in flowing text leaves every label starting at a
+     different x. Fixed-width, centred box puts the icons on one axis and
+     the labels on another. */
+  .ri {
+    flex: 0 0 28px; width: 28px; font-style: normal;
+    font-size: 20px; line-height: 1; text-align: center;
+  }
+  /* Owned count — the shop used to show a hardcoded "×1" on every row,
+     which read as inventory but never changed, so a reward looked like it
+     had done nothing. This is the real number. */
+  .own {
+    font-weight: 700; font-size: 13px; color: var(--accent);
+    background: var(--accent-soft); border-radius: 999px; padding: 3px 9px;
+  }
+  .own.zero { color: var(--ink-soft); background: var(--chipbg); }
+  /* collection badges above the gallery wall */
+  #wallSets { display: flex; flex-wrap: wrap; gap: 8px; padding: 2px 20px 12px; }
+  .setbadge {
+    display: inline-flex; align-items: center; gap: 7px;
+    background: var(--accent-soft); color: var(--accent);
+    border-radius: 999px; padding: 8px 14px; font-weight: 700; font-size: 14px;
+  }
+  .setbadge i { font-style: normal; font-size: 16px; line-height: 1; }
+
+  /* Reward confirmation card. Must sit ABOVE the shop sheet: rewards are
+     claimed from inside the shop, and every .sheet-wrap shares z-index 40,
+     so DOM order alone left the confirmation hidden behind the sheet that
+     opened it. Centred rather than bottom-anchored so it reads as a
+     response to the action, not another drawer. */
+  #rewardSheet { z-index: 60; align-items: center; }
+  .reward-card {
+    background: var(--sheet); backdrop-filter: blur(18px);
+    border-radius: 26px; padding: 30px 26px 24px; margin: auto;
+    width: min(92vw, 360px); text-align: center;
+    box-shadow: var(--shadow);
+  }
+  .reward-icon {
+    font-size: 62px; line-height: 1; margin-bottom: 10px;
+    animation: rewardPop .42s cubic-bezier(.34, 1.56, .64, 1);
+  }
+  @keyframes rewardPop {
+    0% { transform: scale(.4); opacity: 0; }
+    100% { transform: scale(1); opacity: 1; }
+  }
+  .reward-card h2 { font-size: 24px; margin: 0 0 6px; }
+  .reward-sub { color: var(--ink-soft); font-size: 16px; margin: 0 0 18px; }
+  .reward-total {
+    display: inline-block; font-weight: 700; font-size: 17px;
+    color: var(--accent); background: var(--accent-soft);
+    border-radius: 999px; padding: 10px 20px; margin-bottom: 22px;
+  }
+  /* .buy is styled as `.sheet .buy`, and this card is deliberately not a
+     .sheet, so it inherits none of it. Restate rather than widen that
+     selector — the sheet rules assume a bottom drawer. */
+  .reward-card .buy {
+    width: 100%; background: var(--accent); color: #fff;
+    font-weight: 700; font-size: 16px; border-radius: 16px;
+    padding: 15px 18px; min-height: 54px; border: none;
+  }
+  @media (prefers-reduced-motion: reduce) { .reward-icon { animation: none; } }
   .sheet .buy {
     background: var(--accent); color: #fff; font-weight: 700; border-radius: 14px;
     padding: 14px 18px; font-size: 15px; min-height: 52px;
@@ -800,7 +885,15 @@
   .sheet .toggle i { position: absolute; top: 3px; left: 3px; width: 24px; height: 24px; border-radius: 50%; background: #fff; transition: left .2s; }
   .sheet .toggle.on i { left: 25px; }
   .sheet .danger { color: #ff3b30; }
-  .sheet .chips { display: flex; gap: 6px; }
+  .sheet .chips { display: flex; gap: 6px; align-items: center; }
+  /* The chip group is right-aligned, so an 8-coin price is narrower than a
+     10-coin one and every Watch button lands at a different x. Fixed widths
+     put both buttons in true columns down the sheet. */
+  .sheet .chips .buy {
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .sheet .chips .ad-get { min-width: 118px; }
+  .sheet .chips .buy:not(.ad-get) { min-width: 84px; }
   .sheet .chip {
     padding: 13px 14px; border-radius: 14px; background: var(--chipbg);
     font-weight: 700; font-size: 14px; color: var(--ink); min-height: 48px;
@@ -972,25 +1065,40 @@
   <div class="toast" id="toast"></div>
 </div>
 
+<!-- Reward confirmation. A toast was not enough: it appears low, fades in
+     two seconds, and does not say what you now own — so a granted reward
+     was indistinguishable from a broken one. This states the item and the
+     new total, and waits to be dismissed. -->
+<div class="sheet-wrap" id="rewardSheet">
+  <div class="reward-card">
+    <div class="reward-icon" id="rewardIcon">🎁</div>
+    <h2 id="rewardTitle">Reward added</h2>
+    <p class="reward-sub" id="rewardSub"></p>
+    <div class="reward-total" id="rewardTotal"></div>
+    <button class="buy" id="rewardOk">Got it</button>
+  </div>
+</div>
+
 <div id="adBanner"><span>AD</span></div>
 
 <div class="sheet-wrap" id="storeSheet">
   <div class="sheet">
     <h2>🪙 Studio Shop</h2>
-    <div class="row"><span>🪣 Bucket ×1</span><div class="chips">
-      <button class="buy ad-get" data-adget="bucket">🎬 Free</button>
+    <div class="row"><span><i class="ri">🪣</i>Bucket<b class="own" data-own="bucket"></b></span><div class="chips">
+      <button class="buy ad-get" data-adget="bucket">🎬 Watch</button>
       <button class="buy" data-buy="bucket" data-cost="10">10 🪙</button></div></div>
-    <div class="row"><span>💡 Hint ×1</span><div class="chips">
-      <button class="buy ad-get" data-adget="hint">🎬 Free</button>
+    <div class="row"><span><i class="ri">💡</i>Hint<b class="own" data-own="hint"></b></span><div class="chips">
+      <button class="buy ad-get" data-adget="hint">🎬 Watch</button>
       <button class="buy" data-buy="hint" data-cost="8">8 🪙</button></div></div>
-    <div class="row"><span>💣 Bomb ×1</span><div class="chips">
-      <button class="buy ad-get" data-adget="bomb">🎬 Free</button>
+    <div class="row"><span><i class="ri">💣</i>Bomb<b class="own" data-own="bomb"></b></span><div class="chips">
+      <button class="buy ad-get" data-adget="bomb">🎬 Watch</button>
       <button class="buy" data-buy="bomb" data-cost="15">15 🪙</button></div></div>
-    <div class="row"><span>🖌️ Brush ×1</span><div class="chips">
-      <button class="buy ad-get" data-adget="brush">🎬 Free</button>
+    <div class="row"><span><i class="ri">🖌️</i>Brush<b class="own" data-own="brush"></b></span><div class="chips">
+      <button class="buy ad-get" data-adget="brush">🎬 Watch</button>
       <button class="buy" data-buy="brush" data-cost="15">15 🪙</button></div></div>
-    <div class="row"><span>🎬 Free coins</span><button class="buy" data-buy="ad">+15 🪙</button></div>
-    <div class="row"><span>✨ Remove ads &amp; unlock every painting</span><button class="buy" id="shopBuyAll">$7.99</button></div>
+    <div class="row"><span><i class="ri">🪙</i>Coins</span><div class="chips">
+      <button class="buy ad-get" data-adget="coins">🎬 Watch for 15</button></div></div>
+    <div class="row"><span><i class="ri">✨</i>Remove ads &amp; unlock every painting</span><button class="buy" id="shopBuyAll">$7.99</button></div>
   </div>
 </div>
 
@@ -1109,7 +1217,7 @@
   </div>
 </div>
 
-<script src="levels.05a98e74.js"></script>
-<script src="app.fd4696f4.js"></script>
+<script src="levels.14138485.js"></script>
+<script src="app.a4346d4e.js"></script>
 </body>
 </html>

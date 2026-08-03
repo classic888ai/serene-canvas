@@ -36,7 +36,15 @@ const el = (tag, className, text) => {
 // ---------------------------------------------------------------- shims
 // Placeholder integration seams: swap internals for real SDKs at store time
 // (Sentry / Firebase / PostHog) without touching call sites.
+// Events buffer locally (sp_events) exactly as before; when a PostHog key
+// is present they also flush upstream in batches. Empty key = pure no-op,
+// so this ships dark and lights up the moment Terry pastes the key from
+// posthog.com project settings. Distinct id is a random install id — no
+// personal data, resettable by clearing app storage.
+const POSTHOG_KEY = '';                       // e.g. 'phc_XXXX' — off until set
+const POSTHOG_HOST = 'https://us.i.posthog.com';
 const Analytics = {
+  _installId: null,
   track(event, props = {}) {
     try {
       const q = loadJSON('sp_events', []);
@@ -44,7 +52,42 @@ const Analytics = {
       localStorage.setItem('sp_events', JSON.stringify(q.slice(-200)));
     } catch { /* analytics must never break the game */ }
   },
+  flush() {
+    if (!POSTHOG_KEY || !navigator.onLine) return;
+    let q;
+    try { q = loadJSON('sp_events', []); } catch { return; }
+    const pending = q.filter((ev) => !ev.s);
+    if (!pending.length) return;
+    if (!this._installId) {
+      try {
+        this._installId = localStorage.getItem('sp_install')
+          || (Math.random().toString(36).slice(2) + Date.now().toString(36));
+        localStorage.setItem('sp_install', this._installId);
+      } catch { this._installId = 'anon'; }
+    }
+    const batch = pending.slice(0, 50).map((ev) => ({
+      event: ev.e,
+      properties: { ...ev.p, distinct_id: this._installId },
+      timestamp: new Date(ev.t).toISOString(),
+    }));
+    // keepalive lets the hide-flush finish after the app is backgrounded
+    fetch(POSTHOG_HOST + '/batch/', {
+      method: 'POST', keepalive: true,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: POSTHOG_KEY, batch }),
+    }).then((r) => {
+      if (!r.ok) return;
+      try {                         // mark sent instead of deleting — the
+        const q2 = loadJSON('sp_events', []);   // buffer stays a local debug log
+        let n = batch.length;
+        for (const ev of q2) { if (!ev.s && n > 0) { ev.s = 1; n--; } }
+        localStorage.setItem('sp_events', JSON.stringify(q2));
+      } catch { /* ignore */ }
+    }).catch(() => { /* offline or blocked — retry next flush */ });
+  },
 };
+document.addEventListener('visibilitychange',
+  () => { if (document.hidden) Analytics.flush(); });
 // Ad integration: Google AdMob via the Capacitor community plugin on native
 // builds; a placeholder bar on plain web. Call sites are final either way.
 // TEST ad unit IDs (Google's public ones) — swap for real units + the real
@@ -152,9 +195,16 @@ const Ads = {
       this.rewardedReady = true;
     } catch { this.rewardedReady = false; }
   },
-  showRewarded(kind, onReward) {
+  async showRewarded(kind, onReward) {
     Analytics.track('rewarded_start', { kind });
+    // Grant EXACTLY once. Both the showRewardVideoAd() promise and the
+    // Dismissed listener can legitimately fire for one view, and leaked
+    // listeners from earlier views used to fire too — so the guard is what
+    // makes "one video, one reward" true rather than hoped for.
+    let granted = false;
     const grant = () => {
+      if (granted) return;
+      granted = true;
       try { onReward(); } catch { /* grant must not crash */ }
       Analytics.track('rewarded_done', { kind });
     };
@@ -169,16 +219,46 @@ const Ads = {
     }
     if (IS_NATIVE && this._plugin) {
       const AdMob = this._plugin;
-      let rewarded = false;
-      const l1 = AdMob.addListener('onRewardedVideoAdReward', () => { rewarded = true; });
-      const l2 = AdMob.addListener('onRewardedVideoAdDismissed', () => {
-        try { l1.remove(); l2.remove(); } catch { /* listener cleanup */ }
-        if (rewarded) grant();
-        else toast('Watch to the end to earn the reward');
-        this._prepareRewarded();      // preload the next one
-      });
-      AdMob.showRewardVideoAd().catch(() => {
-        try { l1.remove(); l2.remove(); } catch { /* listener cleanup */ }
+      let earned = false;
+      let handles = [];
+      const cleanup = () => {
+        for (const h of handles) { try { h.remove(); } catch { /* gone */ } }
+        handles = [];
+      };
+      // addListener resolves a HANDLE in Capacitor 6 — it is not the handle
+      // itself. The old code called .remove() on the returned Promise, which
+      // threw into a swallowing catch, so no listener was ever removed. Every
+      // view leaked two, and each leaked Dismissed listener re-ran an older
+      // closure on the next dismissal — silently multiplying rewards.
+      try {
+        handles = await Promise.all([
+          AdMob.addListener('onRewardedVideoAdReward', () => { earned = true; }),
+          AdMob.addListener('onRewardedVideoAdDismissed', () => {
+            // Fallback path: the player closed the ad. If the reward event
+            // arrived first this still pays out; grant() dedupes.
+            if (earned) grant();
+            else toast('Watch to the end to earn the reward');
+            cleanup();
+            this._prepareRewarded();      // preload the next one
+          }),
+        ]);
+      } catch { /* listeners unavailable; the promise below still pays */ }
+      try {
+        // v6 resolves this WITH the reward item once the reward is earned.
+        // That is the authoritative signal and the one the old code ignored:
+        // it waited only for Dismissed, so any flow where Dismissed did not
+        // arrive paid nothing at all despite a fully watched video.
+        await AdMob.showRewardVideoAd();
+        earned = true;
+        grant();
+        // A rewarded ad is SINGLE USE — the loaded ad is consumed by showing
+        // it, and the next show fails until another is prepared. The old code
+        // only re-prepared inside the Dismissed handler, the very handler
+        // that was not firing, so a player got exactly one video per launch
+        // and every later attempt found an empty slot.
+        this._prepareRewarded();
+      } catch {
+        cleanup();
         // We are online but AdMob has nothing to serve. An unfilled
         // impression earns exactly nothing, so refusing the player costs
         // goodwill and gains no revenue — FAIL OPEN and let them paint.
@@ -186,7 +266,7 @@ const Ads = {
         toast('No video available right now — this one’s on us');
         grant();
         this._prepareRewarded();
-      });
+      }
       return;
     }
     // web placeholder: simulate a short ad then grant
@@ -485,22 +565,45 @@ function dailyLevelIdFor(dayNumber) {
   return pool[((dayNumber % pool.length) + pool.length) % pool.length].id;
 }
 function dailyLevelId() {
-  return dailyLevelIdFor(Math.floor(Date.now() / 86400000));
+  // PINNED per day. dailyLevelIdFor indexes into the level pool, so the
+  // remote catalog growing mid-session would remap today's free painting
+  // out from under whoever is painting it. First computation of a given
+  // day wins and is stored; merges only affect FUTURE days.
+  const day = Math.floor(Date.now() / 86400000);
+  const key = 'sp_daily_' + day;
+  try {
+    const pinned = localStorage.getItem(key);
+    if (pinned && LEVELS.some((l) => l.id === pinned)) return pinned;
+    const id = dailyLevelIdFor(day);
+    if (id) localStorage.setItem(key, id);
+    localStorage.removeItem('sp_daily_' + (day - 1));   // yesterday's pin
+    return id;
+  } catch { return dailyLevelIdFor(day); }
 }
 const CATS = {
   myphotos:   { label: 'My Photos',   icon: '\uD83D\uDCF7', bg: '#f2ede4' },
-  // Order here IS the shelf + circle order. Zodiac sets sit at the bottom
-  // (niche taste vs. the universal florals/animals/homes), just above the
-  // always-last My Photos.
+  // Order here IS the shelf + circle order. Homes leads: it is the app
+  // icon's subject and the listing's headline promise, so the first shelf
+  // should pay that off before the player scrolls. Zodiac sets sit at the
+  // bottom (niche taste vs. the universal homes/florals/animals), just
+  // above the always-last My Photos.
+  homes:      { label: 'Homes',       icon: '\uD83C\uDFE1', bg: '#f5f0e8' },
+  interiors:  { label: 'Interiors',   icon: '\uD83D\uDECB', bg: '#f3eee8' },
   flowers:    { label: 'Flowers',     icon: '\uD83C\uDF38', bg: '#f6eef0' },
   mandalas:   { label: 'Mandalas',    icon: '\uD83E\uDEB7', bg: '#efe9f2' },
   animals:    { label: 'Animals',     icon: '\uD83D\uDC3E', bg: '#f0ede6' },
   birds:      { label: 'Birds',       icon: '\uD83D\uDC26', bg: '#edf1ea' },
   landscapes: { label: 'Landscapes',  icon: '\uD83C\uDFDE', bg: '#eef2ea' },
-  homes:      { label: 'Homes',       icon: '\uD83C\uDFE1', bg: '#f5f0e8' },
-  interiors:  { label: 'Interiors',   icon: '\uD83D\uDECB', bg: '#f3eee8' },
   stilllife:  { label: 'Still Life',  icon: '\uD83C\uDFFA', bg: '#f2eee9' },
   coastal:    { label: 'Coastal',     icon: '\uD83C\uDF0A', bg: '#eaf0f3' },
+  // Seasonal shelves. Safe to declare with no paintings — buildGallery
+  // filters to categories that have levels, so these stay invisible until
+  // the remote catalog drops art into them, then appear WITHOUT an app
+  // update. Their events below are dormant on the same rule.
+  christmas:  { label: 'Christmas',   icon: '\uD83C\uDF84', bg: '#eef2ec' },
+  easter:     { label: 'Easter',      icon: '\uD83D\uDC23', bg: '#f6f0e8' },
+  mothersday: { label: "Mother's Day", icon: '\uD83D\uDC90', bg: '#f6eef2' },
+  autumn:     { label: 'Autumn',      icon: '\uD83C\uDF41', bg: '#f5efe6' },
   zodiac:     { label: 'Zodiac',      icon: '\uD83C\uDF19', bg: '#eaeaf2' },
   cnyzodiac:  { label: 'Chinese Zodiac', icon: '\uD83D\uDC09', bg: '#f4ebe8' },
 };
@@ -521,6 +624,28 @@ const EVENTS = [
     start: '2029-01-30', end: '2029-02-28' },   // new year Feb 13 2029
   { id: 'lny2030', label: '\uD83D\uDC15 Year of the Dog', cat: 'cnyzodiac',
     start: '2030-01-20', end: '2030-02-18' },   // new year Feb 3 2030
+  // US-calendar holidays for the 50+ audience. Short, specific events are
+  // listed before the long autumn season so they win when windows overlap.
+  { id: 'xmas2026', label: '\uD83C\uDF84 Christmas Paintings', cat: 'christmas',
+    start: '2026-12-01', end: '2026-12-26' },
+  { id: 'xmas2027', label: '\uD83C\uDF84 Christmas Paintings', cat: 'christmas',
+    start: '2027-12-01', end: '2027-12-26' },
+  { id: 'xmas2028', label: '\uD83C\uDF84 Christmas Paintings', cat: 'christmas',
+    start: '2028-12-01', end: '2028-12-26' },
+  { id: 'easter2027', label: '\uD83D\uDC23 Easter Paintings', cat: 'easter',
+    start: '2027-03-14', end: '2027-04-04' },   // Easter Mar 28 2027
+  { id: 'easter2028', label: '\uD83D\uDC23 Easter Paintings', cat: 'easter',
+    start: '2028-04-02', end: '2028-04-16' },   // Easter Apr 16 2028
+  { id: 'easter2029', label: '\uD83D\uDC23 Easter Paintings', cat: 'easter',
+    start: '2029-03-18', end: '2029-04-01' },   // Easter Apr 1 2029
+  { id: 'mday2027', label: "\uD83D\uDC90 For Mother's Day", cat: 'mothersday',
+    start: '2027-04-26', end: '2027-05-10' },   // 2nd Sunday May 9 2027
+  { id: 'mday2028', label: "\uD83D\uDC90 For Mother's Day", cat: 'mothersday',
+    start: '2028-05-01', end: '2028-05-15' },   // May 14 2028
+  { id: 'fall2026', label: '\uD83C\uDF41 Autumn Colors', cat: 'autumn',
+    start: '2026-09-22', end: '2026-11-30' },
+  { id: 'fall2027', label: '\uD83C\uDF41 Autumn Colors', cat: 'autumn',
+    start: '2027-09-22', end: '2027-11-30' },
 ];
 // player-created levels (photo import) — same shape as shipped levels
 const MAX_USER_LEVELS = 20;
@@ -577,10 +702,27 @@ function luminance(hex) {
   const [r, g, b] = hexRGB(hex);
   return (0.299 * r + 0.587 * g + 0.114 * b) / 255;
 }
+// Ghost-grey mapping for UNFILLED cells at working zoom. Widened from
+// 244-t*60 (spread 54): at that range the board's structure was invisible
+// while zoomed in — sky, hills and walls all read as the same pale wash.
+// The floor stays at 148 ON PURPOSE: number ink must clear contrast on
+// every unfilled cell, and mid-greys are where no single ink works. At a
+// 148 floor, a dark ink still reads everywhere (verified ≥3:1 across all
+// 76 palettes); numberInkFor() picks the darker ink for the darker cells.
+// The zoomed-OUT view is a different layer (previewCanvas, spread 152)
+// and was never washed out — do not "fix" it.
+function ghostGray(hex) {
+  return Math.round(242 - (1 - luminance(hex)) * 94);
+}
+function numberInkFor(v) {
+  // Two inks because one cannot span the widened ghost range. Thresholds
+  // and values are VERIFIED, not chosen: worst-case contrast across every
+  // palette entry in the shipped catalog is 3.23:1 (>=3:1 large-text AA).
+  // The old single ink #7a7a82 measured 2.57:1 at the boundary cells.
+  return v < 200 ? '#2e2e33' : '#6a6a72';
+}
 function grayFor(hex) {
-  // darker target color → darker ghost gray (SPEC §3.2)
-  const t = 1 - luminance(hex);
-  const v = Math.round(244 - t * 60);
+  const v = ghostGray(hex);
   return `rgb(${v},${v},${v})`;
 }
 function textColorOn(hex) { return luminance(hex) > 0.62 ? '#3a3a3f' : '#fff'; }
@@ -1176,13 +1318,25 @@ function buildFreeSet() {
   const free = new Set();
   for (const cat in byCat) free.add(byCat[cat][0].id);      // shelf openers
   const target = Math.max(free.size, Math.round(pool.length * (1 - LOCKED_SHARE)));
+  // Spend the remaining slots where they are actually SEEN. Weighting by
+  // depth alone (i * k) fills index-1 of every shelf before index-2 of any,
+  // which spreads the free paintings so thin that the top shelf gets its
+  // opener and nothing else — the first thing a new player sees is one
+  // painting and a row of Watch badges. Multiplying depth by shelf rank
+  // makes depth cheap at the top and expensive at the bottom, so the
+  // shelves above the fold get a real free run and the niche shelves at
+  // the bottom keep just their opener. Same global 80%, better front door.
+  const order = Object.keys(CATS).filter((c) => c !== 'myphotos');
+  const rankOf = (c) => (order.indexOf(c) < 0 ? order.length : order.indexOf(c));
   const rest = [];
   for (const cat in byCat) {
     byCat[cat].forEach((l, i) => {
-      if (!free.has(l.id)) rest.push({ id: l.id, k: i * 1000 + hashId(l.id) % 1000 });
+      if (!free.has(l.id)) {
+        rest.push({ id: l.id, k: i * (1 + rankOf(cat)) * 1000 + hashId(l.id) % 1000 });
+      }
     });
   }
-  rest.sort((a, b) => a.k - b.k);        // earlier in a shelf wins the tie
+  rest.sort((a, b) => a.k - b.k);        // shallow + high on the page wins
   for (const r of rest) {
     if (free.size >= target) break;
     free.add(r.id);
@@ -1340,10 +1494,9 @@ function buildLayers() {
   G.grayCanvas = makeCanvas(W, H);
   const cc = G.colorCanvas.getContext('2d'), gc = G.grayCanvas.getContext('2d');
   const rgb = palette.map((p) => hexRGB(p.hex));
-  const gray = palette.map((p) => {
-    const t = 1 - luminance(p.hex);            // same math as grayFor()
-    return Math.round(244 - t * 60);
-  });
+  const gray = palette.map((p) => ghostGray(p.hex));   // same math as grayFor()
+  // number ink per palette entry — the darker ghost cells need darker ink
+  G.numberInk = gray.map((v) => numberInkFor(v));
   const cimg = cc.createImageData(W, H), gimg = gc.createImageData(W, H);
   const cd = cimg.data, gd = gimg.data;
   for (let i = 0; i < G.cells.length; i++) {
@@ -1405,6 +1558,7 @@ const artImages = new Map();   // level.id → Image (or null after load error)
 function loadLevelArt(level) {
   if (!level.art || artImages.has(level.id)) return;
   const img = new Image();
+  if (level.remote) img.crossOrigin = 'anonymous';
   img.onload = () => {
     if (G.level && G.level.id === level.id) applyRevealStyle();
     // upgrade any waiting promo thumbs IN PLACE — no gallery rebuild, so
@@ -2041,6 +2195,10 @@ function onLevelComplete() {
   FTUE.end();
   Analytics.track('level_complete', { id: G.level.id, cells: G.totalCells });
   profile.imagesCompleted++;
+  // Did this painting COMPLETE its shelf? Computed now (while this level's
+  // progress record is being written) and shown after the win panel closes,
+  // so the trophy never fights the confetti for attention.
+  _pendingSetAward = checkSetComplete(G.level);
   profile.coins += COIN_REWARD;
   let msg = `+${COIN_REWARD} 🪙 earned`;
   if (profile.imagesCompleted === UNLOCKS.bomb) { profile.boosters.bomb += 2; msg += ' · 💣 Bomb unlocked!'; }
@@ -2213,7 +2371,8 @@ function render(now) {
       const i = y * W + x;
       const n = G.cells[i];
       if (!n || G.filled[i]) continue;
-      ctx.fillStyle = n === G.selected ? '#fff' : '#7a7a82';
+      ctx.fillStyle = n === G.selected ? '#fff'
+        : (G.numberInk ? G.numberInk[n - 1] : '#7a7a82');
       ctx.fillText(n, (x + 0.5) * CP, (y + 0.54) * CP);
     }
   }
@@ -2269,7 +2428,7 @@ function drawLoupe(now) {
       ctx.fillRect(x * CP, y * CP, CP, CP);
       ctx.fillStyle = '#fff';
     } else {
-      ctx.fillStyle = '#7a7a82';
+      ctx.fillStyle = G.numberInk ? G.numberInk[n - 1] : '#7a7a82';
     }
     ctx.fillText(n, (x + 0.5) * CP, (y + 0.54) * CP);
   }
@@ -2454,9 +2613,26 @@ function drawConfetti() {
 }
 
 // ---------------------------------------------------------------- gallery
+// Set while navigating in RESPONSE to a back press, so we adjust the UI
+// without touching the history we are already being popped out of.
+let _navFromPop = false;
 function showScreen(name) {
   document.querySelectorAll('.screen').forEach((s) => s.classList.remove('active'));
   $(name).classList.add('active');
+  // Android's back button must leave a painting, not the app. The lobby is
+  // home; every other screen keeps exactly ONE history entry so back lands
+  // there. Without an entry to pop, Android does not fire popstate at all —
+  // it just closes the app, which is what happened from inside a painting.
+  if (!_navFromPop) {
+    if (name === 'gallery') {
+      if (history.state && history.state.screen) {   // leaving via the UI:
+        _sheetPopSuppress++;                          // consume our entry so
+        history.back();                               // back is not a no-op
+      }
+    } else if (!(history.state && history.state.screen)) {
+      history.pushState({ screen: name }, '');        // one entry, not one per hop
+    }
+  }
   if (name === 'gallery') { buildGallery(); Music.stop(); }
   else if (name === 'wall') { buildWall(); Music.stop(); }
   else if (name === 'search') {
@@ -2497,7 +2673,18 @@ function buildGallery() {
     const sec = el('section', 'shelf' + (isEvent ? ' event' : ''));
     sec.id = 'shelf-' + cat;
     const head = el('div', 'shelf-head');
-    head.appendChild(el('span', '', isEvent ? ev.label : `${meta.icon} ${meta.label}`));
+    // Icon in its own fixed-width box rather than inline in the text. Emoji
+    // advance widths differ per glyph, so "🏡 Homes" and "🛋 Interiors" as
+    // flowing strings start their LABELS at different x — visible as ragged
+    // headings all the way down the lobby. Two boxes, two clean columns.
+    if (isEvent) {
+      head.appendChild(el('span', '', ev.label));
+    } else {
+      const h = el('span', 'shelf-title');
+      h.appendChild(el('i', 'ri', meta.icon));
+      h.appendChild(el('span', '', meta.label));
+      head.appendChild(h);
+    }
     // no count here on purpose — a number caps the sense of how much there
     // is and discourages scrolling; let the shelf just keep going
     if (isEvent) head.appendChild(el('span', 'event-count', `Ends in ${eventDaysLeft(ev)}d`));
@@ -3053,6 +3240,23 @@ function buildWall() {
     ? `${done.length} ${done.length === 1 ? 'painting' : 'paintings'}`
     : 'Nothing hung yet';
 
+  // earned collection badges — permanent trophies above the wall
+  let sets = $('wallSets');
+  if (!sets) {
+    sets = el('div'); sets.id = 'wallSets';
+    grid.parentNode.insertBefore(sets, grid);
+  }
+  sets.replaceChildren();
+  const earned = Object.keys(profile.setsEarned || {})
+    .filter((c) => CATS[c]).sort((a, b) => profile.setsEarned[a] - profile.setsEarned[b]);
+  for (const c of earned) {
+    const chip = el('span', 'setbadge');
+    chip.appendChild(el('i', '', CATS[c].icon));
+    chip.appendChild(el('b', '', CATS[c].label));
+    sets.appendChild(chip);
+  }
+  sets.style.display = earned.length ? '' : 'none';
+
   if (!done.length) {
     const empty = el('div');
     empty.id = 'wallEmpty';
@@ -3451,7 +3655,56 @@ function updateCoinUI() {
   $('coinCount').textContent = profile.coins;
   $('galleryCoinCount').textContent = profile.coins;
 }
-function openStore() { $('storeSheet').classList.add('open'); }
+// ---- inventory + reward feedback -----------------------------------------
+// The shop used to print a hardcoded "×1" beside every item. It read as an
+// inventory count but was static markup, so watching a video changed nothing
+// visible anywhere in the lobby — the reward WAS granted, it just had no way
+// of showing. updateToolButtons() only writes the in-level toolbar badges,
+// which you cannot see from the shop.
+const BOOSTER_META = {
+  bucket: { icon: '🪣', label: 'Bucket' },
+  hint:   { icon: '💡', label: 'Hint' },
+  bomb:   { icon: '💣', label: 'Bomb' },
+  brush:  { icon: '🖌️', label: 'Brush' },
+  coins:  { icon: '🪙', label: 'Coins' },
+};
+
+function updateShopUI() {
+  document.querySelectorAll('[data-own]').forEach((el) => {
+    const n = profile.boosters[el.dataset.own] || 0;
+    el.textContent = n ? `${n} in your kit` : 'none yet';
+    el.classList.toggle('zero', n === 0);
+  });
+}
+
+// One place that grants, updates every surface, persists, and confirms.
+function grantReward(kind, amount = 1) {
+  const meta = BOOSTER_META[kind] || { icon: '🎁', label: kind };
+  let total;
+  if (kind === 'coins') {
+    profile.coins += amount;
+    total = `${profile.coins} coins total`;
+  } else {
+    profile.boosters[kind] = (profile.boosters[kind] || 0) + amount;
+    total = `${profile.boosters[kind]} in your kit`;
+  }
+  updateCoinUI(); updateToolButtons(); updateShopUI();
+  saveNow();          // persist immediately — not saveSoon(); a reward must
+                      // survive the player closing the app straight after
+  $('rewardIcon').textContent = meta.icon;
+  $('rewardTitle').textContent = `+${amount} ${meta.label}`;
+  $('rewardSub').textContent = kind === 'coins'
+    ? 'Added to your balance' : 'Added to your painting kit';
+  $('rewardTotal').textContent = total;
+  $('rewardSheet').classList.add('open');
+}
+
+if ($('rewardOk')) {
+  $('rewardOk').addEventListener('click',
+    () => $('rewardSheet').classList.remove('open'));
+}
+
+function openStore() { updateShopUI(); $('storeSheet').classList.add('open'); }
 
 $('btnBack').addEventListener('click', () => { saveNow(); showScreen('gallery'); });
 $('btnSettings').addEventListener('click', () => {
@@ -3470,35 +3723,119 @@ $('darkToggle').addEventListener('click', () => {
   saveSoon();
 });
 
+// Backdrop tap goes through closeSheet() like every other close path. Doing
+// classList.remove() directly left the sheet's history entry behind, so the
+// next back press was silently eaten popping a dead entry.
 document.querySelectorAll('.sheet-wrap').forEach((w) =>
-  w.addEventListener('click', (e) => { if (e.target === w) w.classList.remove('open'); }));
+  w.addEventListener('click', (e) => { if (e.target === w) closeSheet(w); }));
+
+// ---- sheets must always be escapable ------------------------------------
+// Backdrop-tap used to be the ONLY way out of a sheet. That fails whenever
+// the sheet is tall enough to cover the backdrop (Settings, 855px on a
+// 412x915 Pixel 7) and it is an invisible affordance even when it works.
+// Two additions: a real close button on every sheet, and Android's back
+// gesture closing the top sheet rather than leaving the app.
+document.querySelectorAll('.sheet-wrap').forEach((w) => {
+  const panel = w.querySelector('.sheet');
+  if (!panel || panel.querySelector('.sheet-close')) return;
+  const btn = el('button', 'sheet-close', '✕');
+  btn.setAttribute('aria-label', 'Close');
+  btn.addEventListener('click', () => closeSheet(w));
+  panel.insertBefore(btn, panel.firstChild);
+});
+
+// One history entry per open sheet, so the hardware/gesture back button
+// pops the sheet. The app declares enableOnBackInvokedCallback="false", so
+// back arrives here as a normal popstate.
+let _sheetPopSuppress = 0;
+// Open ORDER, which is not DOM order. Querying `.sheet-wrap.open` and taking
+// the last match returns the last in the document — so with the reward card
+// (declared early) stacked over the shop (declared later), back closed the
+// shop and left the card floating. Track the order things actually opened.
+const _sheetStack = [];
+function topOpenSheet() {
+  for (let i = _sheetStack.length - 1; i >= 0; i--) {
+    const w = document.getElementById(_sheetStack[i]);
+    if (w && w.classList.contains('open')) return w;
+  }
+  return null;
+}
+// Closing is just removing the class. History is reconciled centrally by the
+// observer below, because there are a dozen places that close a sheet
+// directly and any new one would otherwise silently desync history again.
+function closeSheet(w) { w.classList.remove('open'); }
+(function trackSheetHistory() {
+  const obs = new MutationObserver((muts) => {
+    for (const m of muts) {
+      const w = m.target;
+      const open = w.classList.contains('open');
+      if (open === (w.dataset.wasOpen === '1')) continue;   // class churn
+      w.dataset.wasOpen = open ? '1' : '0';
+      if (open) {
+        _sheetStack.push(w.id);
+        history.pushState({ sheet: w.id }, '');
+      } else {
+        const i = _sheetStack.lastIndexOf(w.id);
+        if (i >= 0) _sheetStack.splice(i, 1);
+        // Consume this sheet's history entry however it was closed — ✕,
+        // backdrop, "Got it", or any of the direct classList.remove call
+        // sites. Skipped when the close came FROM a back press, where the
+        // browser has already popped the entry for us.
+        const fromPop = w.dataset.fromPop === '1';
+        delete w.dataset.fromPop;
+        if (!fromPop && history.state && history.state.sheet === w.id) {
+          _sheetPopSuppress++;
+          history.back();
+        }
+      }
+    }
+  });
+  document.querySelectorAll('.sheet-wrap').forEach((w) => {
+    w.dataset.wasOpen = w.classList.contains('open') ? '1' : '0';
+    obs.observe(w, { attributes: true, attributeFilter: ['class'] });
+  });
+  // Back order: top sheet first, then out of any screen to the lobby, and
+  // only then let Android close the app.
+  addEventListener('popstate', () => {
+    if (_sheetPopSuppress > 0) { _sheetPopSuppress--; return; }
+    const w = topOpenSheet();
+    if (w) {
+      // Marked on the ELEMENT, not a plain flag: MutationObserver callbacks
+      // are microtasks, so a flag set and cleared around this line would
+      // already read false by the time the observer runs.
+      w.dataset.fromPop = '1';
+      w.classList.remove('open');
+      return;
+    }
+    const active = document.querySelector('.screen.active');
+    if (active && active.id !== 'gallery') {
+      if (active.id === 'game') saveNow();      // never lose a painting to a back press
+      _navFromPop = true;
+      showScreen('gallery');
+      _navFromPop = false;
+    }
+  });
+})();
 
 document.querySelectorAll('[data-buy]').forEach((b) =>
   b.addEventListener('click', () => {
     const what = b.dataset.buy;
     Analytics.track('shop_buy', { what });
-    if (what === 'ad') {   // rewarded-ad stub — becomes a real ad SDK call later
-      profile.coins += 15;
-      toast('+15 🪙 Thanks for watching! (ad placeholder)');
-    } else {
-      const cost = +b.dataset.cost;
-      if (profile.coins < cost) { toast("A few more coins and it's yours"); return; }
-      profile.coins -= cost;
-      profile.boosters[what]++;
-      toast('Added to your kit!');
-    }
-    updateCoinUI(); updateToolButtons(); saveSoon();
+    const cost = +b.dataset.cost;
+    if (profile.coins < cost) { toast("A few more coins and it's yours"); return; }
+    profile.coins -= cost;
+    grantReward(what);          // handles inventory, every UI, save, confirm
   }));
 
-// rewarded-video "get one free" buttons in the shop
+// Watch-a-video buttons in the shop. "Free coins" used to sit on the
+// data-buy path with a `what === 'ad'` branch that granted 15 coins WITHOUT
+// showing an ad, and toasted "(ad placeholder)" in production — giving away
+// the reward and earning nothing. It now goes through the same rewarded flow
+// as everything else.
 document.querySelectorAll('[data-adget]').forEach((b) =>
   b.addEventListener('click', () => {
     const kind = b.dataset.adget;
-    Ads.showRewarded(kind, () => {
-      profile.boosters[kind]++;
-      toast('+1 🎉 Enjoy!');
-      updateToolButtons(); saveSoon();
-    });
+    Ads.showRewarded(kind, () => grantReward(kind, kind === 'coins' ? 15 : 1));
   }));
 
 function syncSettingToggles() {
@@ -3587,11 +3924,15 @@ $('setReset').addEventListener('click', () => {
 $('btnHome').addEventListener('click', () => {
   $('winOverlay').classList.remove('open');
   G.confetti.length = 0;
+  if (_pendingSetAward) { showSetAward(_pendingSetAward); _pendingSetAward = null; }
+  else Review.maybeAsk();
   showScreen('gallery');
 });
 $('btnNext').addEventListener('click', () => {
   $('winOverlay').classList.remove('open');
   G.confetti.length = 0;
+  if (_pendingSetAward) { showSetAward(_pendingSetAward); _pendingSetAward = null; }
+  else Review.maybeAsk();
   const next = LEVELS.find((l) => !levelProgressSummary(l).done);
   if (next) openLevel(next);
   else { toast('Every painting finished — beautifully done. New collections soon.'); showScreen('gallery'); }
@@ -3626,7 +3967,138 @@ if (typeof LEVELS === 'undefined' || !LEVELS.length) {
   throw new Error('levels.js missing or empty');
 }
 applyTheme();
+
+// ---- collection sets: finish every painting on a shelf --------------------
+// The 50+ audience skews completionist; a set award turns "I painted one"
+// into "I am working through the Birds". Earned sets persist so the trophy
+// shows exactly once, and My Gallery wears the badges permanently.
+let _pendingSetAward = null;
+function checkSetComplete(level) {
+  const cat = level.cat;
+  if (!cat || cat === 'myphotos') return null;
+  if ((profile.setsEarned || {})[cat]) return null;
+  const shelf = LEVELS.filter((l) => l.cat === cat);
+  // the level being completed right now counts — its record just saved
+  if (!shelf.length || !shelf.every((l) =>
+    l.id === level.id || levelProgressSummary(l).done)) return null;
+  profile.setsEarned = profile.setsEarned || {};
+  profile.setsEarned[cat] = Date.now();
+  Analytics.track('set_complete', { cat, size: shelf.length });
+  saveNow();
+  return cat;
+}
+function showSetAward(cat) {
+  const meta = CATS[cat];
+  if (!meta) return;
+  $('rewardIcon').textContent = '\uD83C\uDFC6';
+  $('rewardTitle').textContent = `${meta.label} Collection`;
+  $('rewardSub').textContent = 'Every painting on this shelf, finished';
+  $('rewardTotal').textContent = `\u2728 Set complete \u2014 ${meta.icon} badge earned`;
+  $('rewardSheet').classList.add('open');
+}
+
+// ---- store review ask -----------------------------------------------------
+// Native Play in-app review, asked at the moment of highest goodwill: the
+// player has just finished a painting and closed the win panel. Play's API
+// decides whether a dialog actually appears and self-throttles, so the
+// ladder here only bounds how often we ASK. Never on the web build.
+const Review = {
+  LADDER: [2, 7, 20],                      // completions that trigger an ask
+  _plugin: null,
+  init() {
+    if (!IS_NATIVE) return;
+    try {
+      const reg = CAP && CAP.Plugins;
+      this._plugin = (reg && (reg.InAppReview || reg.RateApp)) || null;
+    } catch { this._plugin = null; }
+  },
+  maybeAsk() {
+    if (!this._plugin) return;
+    const asked = profile.reviewAsks || 0;
+    const due = this.LADDER[asked];
+    if (due === undefined || profile.imagesCompleted < due) return;
+    profile.reviewAsks = asked + 1;
+    saveNow();
+    Analytics.track('review_asked', { at: profile.imagesCompleted });
+    try { this._plugin.requestReview(); } catch { /* silently skip */ }
+  },
+};
+
+// ---- remote catalog: the daily-drop engine --------------------------------
+// The APK ships a bundled levels.js; this fetches catalog.json from the
+// Pages deploy and merges levels the bundle has never heard of. Rules that
+// keep it safe:
+//   * ADD only, never replace — replacing a level changes its cells and
+//     silently invalidates saved progress (sp_prog_<id> has no version).
+//   * unknown categories are skipped (no shelf to render them on) — the
+//     holiday cats above exist precisely so their drops are known.
+//   * cached catalog applies SYNCHRONOUSLY at boot, before the first
+//     buildGallery, so a session never changes shape midway; a live fetch
+//     may merge later but only ever adds, and the daily is pinned.
+//   * remote art needs crossOrigin: shareArtwork exports the canvas, and
+//     a tainted canvas would break sharing for every remote painting.
+const RemoteCatalog = {
+  URL: 'https://classic888ai.github.io/serene-canvas/catalog.json',
+  applied: new Set(),
+  merge(cat, live) {
+    if (!cat || !Array.isArray(cat.levels)) return 0;
+    const have = new Set(LEVELS.map((l) => l.id));
+    let added = 0;
+    for (const lv of cat.levels) {
+      try {
+        if (!lv || !lv.id || have.has(lv.id) || this.applied.has(lv.id)) continue;
+        if (!CATS[lv.cat]) continue;                     // no shelf for it
+        if (!(lv.width > 0) || !(lv.height > 0)) continue;
+        if (typeof lv.cells !== 'string' ||
+            decodeCells(lv.cells).length !== lv.width * lv.height) continue;
+        if (lv.art && cat.artBase) { lv.art = cat.artBase + lv.id + '.jpg'; lv.remote = 1; }
+        LEVELS.push(lv);
+        this.applied.add(lv.id);
+        added++;
+      } catch { /* one bad record must not sink the drop */ }
+    }
+    if (added) {
+      freeSet = null;                                    // re-deal the free slots
+      if (live) {
+        const active = document.querySelector('.screen.active');
+        if (active && active.id === 'gallery') buildGallery();
+        toast(`\uD83C\uDFA8 ${added} new painting${added === 1 ? '' : 's'} arrived`);
+      }
+      Analytics.track('catalog_merged', { n: added, live: !!live });
+    }
+    return added;
+  },
+  boot() {
+    try {                                     // cached copy, synchronous
+      const c = localStorage.getItem('sp_catalog');
+      if (c) this.merge(JSON.parse(c), false);
+    } catch { /* corrupt cache = ignore */ }
+    this.refresh();
+  },
+  async refresh() {
+    if (!navigator.onLine) return;
+    try {
+      const ctrl = new AbortController();
+      setTimeout(() => ctrl.abort(), 6000);
+      const r = await fetch(this.URL, { signal: ctrl.signal, cache: 'no-store' });
+      if (!r.ok) return;
+      const text = await r.text();
+      const cat = JSON.parse(text);
+      try {
+        const prev = localStorage.getItem('sp_catalog_v');
+        if (text.length < 3000000) {          // stay far from the quota
+          localStorage.setItem('sp_catalog', text);
+          localStorage.setItem('sp_catalog_v', String(cat.version || ''));
+        }
+        if (prev === String(cat.version || '')) return;   // nothing new
+      } catch { /* quota — still merge this session */ }
+      this.merge(cat, true);
+    } catch { Analytics.track('catalog_fetch_fail', {}); }
+  },
+};
+
 loadUserLevels();
+RemoteCatalog.boot();
 resizeBoard();
 buildGallery();
 // warm the painting-reveal art in idle time: promo thumbs upgrade once and
@@ -3638,6 +4110,7 @@ setTimeout(() => {
 }, 900);
 updateCoinUI();
 Ads.init();   // AdMob on native builds, placeholder bar on plain web
+Review.init();
 syncOwnedUI();
 applyIapVisibility();
 applyReminderVisibility();
