@@ -2679,10 +2679,13 @@ function buildGallery() {
       .map((l) => ({ l, s: levelProgressSummary(l) }));
     entries.sort((a, b) => {
       const rank = (e) => (e.s.done ? 2 : e.s.pct > 0 ? 0 : 1);
-      // among untouched paintings, free ones lead the shelf — the player
-      // meets paintable art before the Watch badges
+      // among untouched paintings: free ones lead, and within the free
+      // run the shelf climbs easiest-first — a new player's first row
+      // reads as an on-ramp, not a wall
+      const sc = (e) => e.l.palette.reduce((s, c) => s + c.count, 0) * e.l.palette.length;
       return rank(a) - rank(b) || b.s.ts - a.s.ts
-        || (isLocked(a.l) ? 1 : 0) - (isLocked(b.l) ? 1 : 0);
+        || (isLocked(a.l) ? 1 : 0) - (isLocked(b.l) ? 1 : 0)
+        || sc(a) - sc(b);
     });
     const isEvent = ev && cat === ev.cat;
     const meta = CATS[cat] || { icon: '\uD83C\uDF89', label: ev ? ev.label : cat, bg: '#fff3e2' };
