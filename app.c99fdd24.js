@@ -1319,7 +1319,17 @@ function buildFreeSet() {
   const byCat = {};
   for (const l of pool) (byCat[l.cat] = byCat[l.cat] || []).push(l);
   const free = new Set();
-  for (const cat in byCat) free.add(byCat[cat][0].id);      // shelf openers
+  // The guaranteed-free opener of each shelf is its EASIEST painting, not
+  // its first. A brand-new player's first tap should be a quick win — the
+  // on-ramp — and picking by score (cells x colours, same math as
+  // tierFor) works on every client: remote-merged levels compete on score
+  // no matter where the merge appended them.
+  const scoreOf = (l) => l.palette.reduce((s, c) => s + c.count, 0) * l.palette.length;
+  for (const cat in byCat) {
+    let best = byCat[cat][0];
+    for (const l of byCat[cat]) if (scoreOf(l) < scoreOf(best)) best = l;
+    free.add(best.id);
+  }
   const target = Math.max(free.size, Math.round(pool.length * (1 - LOCKED_SHARE)));
   // Spend the remaining slots where they are actually SEEN. Weighting by
   // depth alone (i * k) fills index-1 of every shelf before index-2 of any,
@@ -2669,7 +2679,10 @@ function buildGallery() {
       .map((l) => ({ l, s: levelProgressSummary(l) }));
     entries.sort((a, b) => {
       const rank = (e) => (e.s.done ? 2 : e.s.pct > 0 ? 0 : 1);
-      return rank(a) - rank(b) || b.s.ts - a.s.ts;
+      // among untouched paintings, free ones lead the shelf — the player
+      // meets paintable art before the Watch badges
+      return rank(a) - rank(b) || b.s.ts - a.s.ts
+        || (isLocked(a.l) ? 1 : 0) - (isLocked(b.l) ? 1 : 0);
     });
     const isEvent = ev && cat === ev.cat;
     const meta = CATS[cat] || { icon: '\uD83C\uDF89', label: ev ? ev.label : cat, bg: '#fff3e2' };
